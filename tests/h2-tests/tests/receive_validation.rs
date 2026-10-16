@@ -190,3 +190,45 @@ async fn raw_path_fragments_are_rejected_but_encoded_hashes_survive() {
             .unwrap();
     }
 }
+
+#[tokio::test]
+async fn headers_after_request_end_stream_preserve_connection_error() {
+    for kind in ["empty", "path", "status", "oversized"] {
+        let (io, mut peer) = mock::new();
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let peer = async move {
+            peer.assert_server_handshake().await;
+            peer.send_frame(
+                frames::headers(1)
+                    .request("GET", "https://example.com/")
+                    .eos(),
+            )
+            .await;
+            accepted_rx.await.unwrap();
+            let headers = if kind == "empty" {
+                frames::headers(1).eos().into()
+            } else {
+                trailers(kind)
+            };
+            peer.send_frame(headers).await;
+            peer.recv_frame(frames::go_away(1).protocol_error()).await;
+        };
+        let server = async move {
+            let mut connection = server::Builder::new()
+                .max_header_list_size(256)
+                .handshake::<_, Bytes>(io)
+                .await
+                .unwrap();
+            let (mut request, response) = connection.next().await.unwrap().unwrap();
+            accepted_tx.send(()).unwrap();
+            let error = connection.next().await.unwrap().err().unwrap();
+            assert!(error.is_go_away());
+            assert_eq!(error.reason(), Some(Reason::PROTOCOL_ERROR));
+            assert!(request.body_mut().data().await.is_none());
+            drop(response);
+        };
+        tokio::time::timeout(Duration::from_secs(5), join(peer, server))
+            .await
+            .unwrap();
+    }
+}
