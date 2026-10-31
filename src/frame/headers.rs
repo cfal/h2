@@ -879,7 +879,7 @@ impl HeaderBlock {
                     header_list_way_too_large = true;
                     ControlFlow::Break(())
                 } else {
-                    if headers_size >= max_header_list_size && !self.is_over_size {
+                    if headers_size > max_header_list_size && !self.is_over_size {
                         tracing::trace!("load_hpack; header list size over max");
                         self.is_over_size = true;
                     }
@@ -1216,6 +1216,44 @@ mod test {
                 ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn header_list_size_limit_is_inclusive() {
+        for (encoded, size) in [(&b"\x88"[..], 42), (&b"\x00\x01x\x01v"[..], 34)] {
+            for limit in [size - 1, size, size + 1] {
+                let mut headers =
+                    Headers::new(StreamId::from(1), Pseudo::default(), HeaderMap::new());
+                let mut payload = BytesMut::from(encoded);
+                let mut decoder = hpack::Decoder::new(4096);
+                headers
+                    .load_hpack(&mut payload, limit, &mut decoder)
+                    .unwrap();
+                assert_eq!(headers.is_over_size(), size > limit);
+                assert_eq!(
+                    headers.header_block.calculate_header_list_size(),
+                    if size > limit { 0 } else { size }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn header_list_abuse_limit_is_separate_from_configured_limit() {
+        // Each literal contributes 34 decoded bytes, including field overhead.
+        for count in [1, 2, 4, 5] {
+            let mut headers = Headers::new(StreamId::from(1), Pseudo::default(), HeaderMap::new());
+            let mut payload = BytesMut::from(&b"\x00\x01x\x01v".repeat(count)[..]);
+            let mut decoder = hpack::Decoder::new(4096);
+            let result = headers.load_hpack(&mut payload, 34, &mut decoder);
+            if count > 4 {
+                assert!(matches!(result, Err(Error::HeaderListWayTooLarge)));
+            } else {
+                result.unwrap();
+                assert_eq!(headers.is_over_size(), count > 1);
+                assert_eq!(headers.fields().get_all("x").iter().count(), 1);
+            }
+        }
     }
 
     #[test]
